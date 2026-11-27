@@ -5,13 +5,13 @@ import { fileURLToPath } from "node:url";
 import { readSecrets } from "./secrets.ts";
 import { pluginOAuthLoggedIn, pluginOAuthNeedsRelogin, pluginOAuthProvider, type PluginOAuthConfig } from "./plugin-oauth.ts";
 import { McpOAuthAuthorizationRequiredError } from "@earendil-works/pi-mcp/oauth";
-import { JSON_RPC_ERROR_CODES, McpAuthRequiredError, McpClient, McpError, McpHttpError, StdioTransport, StreamableHttpTransport, limitMcpContent, normalizeMcpInputSchema, toLlmContent, validateMcpServerConfig, type Tool } from "@earendil-works/pi-mcp";
+import { JSON_RPC_ERROR_CODES, McpAuthRequiredError, McpClient, McpError, McpHttpError, StdioTransport, StreamableHttpTransport, limitMcpContent, normalizeMcpInputSchema, toLlmContent, validateMcpServerConfig, type CallToolResult, type Tool } from "@earendil-works/pi-mcp";
 import type { Card, CardActionRequest, CardActionResult } from "../../shared/cards.ts";
 import type { PluginCredentialRole, PluginLoginRole, PluginToolLoginPollResult, PluginToolLoginStartResult, PluginToolLoginStatus, PluginToolLoginView } from "../../shared/types.ts";
 import { t } from "../../shared/i18n.ts";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { cardTitle, validateCard } from "./cards.ts";
-import { buildElicitationCard, parseElicitationRequest, resolveElicitationAction, type McpElicitationResult, type ParsedMcpElicitation } from "./mcp-elicitation.ts";
+import { buildElicitationCard, extractUrlElicitationsFromError, parseElicitationRequest, resolveElicitationAction, type McpElicitationResult, type ParsedMcpElicitation } from "./mcp-elicitation.ts";
 import { pauseToolTimeoutForUser } from "./tool-timeout.ts";
 import type { TSchema } from "typebox";
 import { resolvePluginMcp, validatePluginValues } from "./plugin-config.ts";
@@ -29,9 +29,11 @@ type ActiveCallContext = {
 type PendingElicitation = {
   pluginId: string;
   service: string;
+  elicitationId?: string;
   parsed: ParsedMcpElicitation;
   resolve: (result: McpElicitationResult) => void;
   expire: (reason: string) => void;
+  complete?: (result: CardActionResult) => void;
 };
 type Connection = {
   state: PluginServiceState;
@@ -460,6 +462,7 @@ export class PluginHost {
     });
     connection.client = client;
     client.setRequestHandler("elicitation/create", (params, { signal }) => this.handleElicitation(connection, params, signal));
+    client.onNotification("notifications/elicitation/complete", (params) => this.handleElicitationComplete(state.pluginId, state.name, params));
     client.onClose(() => {
       if (connection.stopped || this.closed || connection.client !== client) return;
       connection.client = undefined;
@@ -543,13 +546,13 @@ export class PluginHost {
     if (connection.state.status === "idle" || connection.state.status === "connecting") await this.connect(connection, connection.raw);
     if (connection.state.status !== "connected" || !connection.client) throw new Error(connection.state.error ?? `插件服务 ${connection.state.pluginId}/${connection.state.name} 未连接`);
   }
-  private async handleElicitation(connection: Connection, params: unknown, requestSignal: AbortSignal): Promise<McpElicitationResult> {
-    const parsed = parseElicitationRequest(params);
-    // MCP 2025-11-25 的 elicitation/create 载荷不含父 tools/call 的 requestId；共享连接上归属到最近一个未中止的活跃调用上下文。
-    const contexts = connection.callContexts ?? [];
-    const active = [...contexts].reverse().find((ctx) => !ctx.signal?.aborted);
-    if (!active) return { action: "decline" };
-    if (requestSignal.aborted) return { action: "cancel" };
+  private async presentElicitation(
+    connection: Connection,
+    parsed: ParsedMcpElicitation,
+    active: ActiveCallContext,
+    requestSignal?: AbortSignal,
+  ): Promise<McpElicitationResult> {
+    if (requestSignal?.aborted || active.signal?.aborted) return { action: "cancel" };
     const pluginId = connection.state.pluginId;
     const service = connection.state.name;
     const pluginName = this.displayName(pluginId);
@@ -562,8 +565,8 @@ export class PluginHost {
     let handle: PluginElicitationCardHandle | undefined;
     try {
       handle = await active.onElicitation({ pluginId, pluginName, service, card: validation.value.card });
-      if (requestSignal.aborted || active.signal?.aborted) {
-        handle.expire(requestSignal.aborted ? t("这项确认已取消") : t("这次操作已取消"));
+      if (requestSignal?.aborted || active.signal?.aborted) {
+        handle.expire(requestSignal?.aborted ? t("这项确认已取消") : t("这次操作已取消"));
         return { action: "cancel" };
       }
       return await new Promise<McpElicitationResult>((resolve) => {
@@ -571,7 +574,7 @@ export class PluginHost {
         const finish = (result: McpElicitationResult) => {
           if (settled) return;
           settled = true;
-          requestSignal.removeEventListener("abort", onRequestAbort);
+          requestSignal?.removeEventListener("abort", onRequestAbort);
           active.signal?.removeEventListener("abort", onCallAbort);
           this.pendingElicitations.delete(handle!.cardId);
           resolve(result);
@@ -587,16 +590,36 @@ export class PluginHost {
         this.pendingElicitations.set(handle!.cardId, {
           pluginId,
           service,
+          ...(parsed.mode === "url" && parsed.elicitationId ? { elicitationId: parsed.elicitationId } : {}),
           parsed,
           resolve: finish,
           expire: handle!.expire,
+          ...(handle!.complete ? { complete: handle!.complete } : {}),
         });
-        requestSignal.addEventListener("abort", onRequestAbort, { once: true });
+        requestSignal?.addEventListener("abort", onRequestAbort, { once: true });
         active.signal?.addEventListener("abort", onCallAbort, { once: true });
       });
     } finally {
       handle?.onDone?.();
       resumeTimeout();
+    }
+  }
+  private async handleElicitation(connection: Connection, params: unknown, requestSignal: AbortSignal): Promise<McpElicitationResult> {
+    const parsed = parseElicitationRequest(params);
+    // MCP 2025-11-25 的 elicitation/create 载荷不含父 tools/call 的 requestId；共享连接上归属到最近一个未中止的活跃调用上下文。
+    const contexts = connection.callContexts ?? [];
+    const active = [...contexts].reverse().find((ctx) => !ctx.signal?.aborted);
+    if (!active) return { action: "decline" };
+    return this.presentElicitation(connection, parsed, active, requestSignal);
+  }
+  private handleElicitationComplete(pluginId: string, service: string, params: unknown): void {
+    const elicitationId = isObject(params) && typeof params.elicitationId === "string" ? params.elicitationId.trim() : "";
+    if (!elicitationId) return;
+    for (const [cardId, entry] of [...this.pendingElicitations]) {
+      if (entry.pluginId !== pluginId || entry.service !== service || entry.elicitationId !== elicitationId) continue;
+      this.pendingElicitations.delete(cardId);
+      entry.complete?.({ action: { tag: "button", elicitation_action: "accept" }, buttonText: t("已完成") });
+      entry.resolve({ action: "accept" });
     }
   }
   answerElicitation(cardId: string, input: CardActionRequest): { found: false } | { found: true; ok: false; errors: Record<string, string> } | { found: true; ok: true; cardResult: CardActionResult } {
@@ -624,7 +647,7 @@ export class PluginHost {
       entry.resolve({ action: "cancel" });
     }
   }
-  async call(id: string, service: string, tool: string, args: Record<string, unknown>, signal?: AbortSignal, options?: { onElicitation?: PluginElicitationHandler }) {
+  async call(id: string, service: string, tool: string, args: Record<string, unknown>, signal?: AbortSignal, options?: { onElicitation?: PluginElicitationHandler }): Promise<CallToolResult> {
     const connection = this.connections.get(this.key(id, service));
     if (!connection) throw new Error(`插件服务 ${id}/${service} 未连接`);
     await this.ensureConnected(connection);
@@ -637,7 +660,29 @@ export class PluginHost {
     if (connection.idle) clearTimeout(connection.idle);
     connection.idle = undefined;
     const callOptions = signal || options?.onElicitation ? { ...(signal ? { signal } : {}), timeoutMs: 0 } : {};
-    try { return await client.callTool(tool, args, callOptions); }
+    const MAX_URL_ELICITATION_RETRIES = 3;
+    try {
+      for (let attempt = 0; ; attempt++) {
+        try {
+          return await client.callTool(tool, args, callOptions);
+        } catch (error) {
+          const urlElicitations = callContext && attempt < MAX_URL_ELICITATION_RETRIES
+            ? extractUrlElicitationsFromError(error)
+            : [];
+          if (!urlElicitations.length || !callContext) throw error;
+          for (const elicit of urlElicitations) {
+            const outcome = await this.presentElicitation(connection, elicit, callContext);
+            if (outcome.action !== "accept") {
+              const name = this.displayName(id);
+              const text = outcome.action === "decline"
+                ? t("用户拒绝了 {plugin} 的外部确认。", { plugin: name })
+                : t("用户取消了 {plugin} 的外部确认。", { plugin: name });
+              return { content: [{ type: "text", text }], isError: true };
+            }
+          }
+        }
+      }
+    }
     catch (error) {
       const authError = error instanceof McpOAuthAuthorizationRequiredError || (error instanceof McpHttpError && (error.status === 401 || error.status === 403));
       if (authError) connection.state.status = hadCredentials ? "needs_relogin" : "needs_login";
@@ -721,6 +766,7 @@ export type PluginCardErrorHandler = (pluginId: string, message: string) => void
 export interface PluginElicitationCardHandle {
   cardId: string;
   expire: (reason: string) => void;
+  complete?: (result: CardActionResult) => void;
   onDone?: () => void;
 }
 export type PluginElicitationHandler = (payload: { pluginId: string; pluginName: string; service: string; card: Card }) => Promise<PluginElicitationCardHandle>;

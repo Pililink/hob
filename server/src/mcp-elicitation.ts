@@ -2,6 +2,8 @@ import { JSON_RPC_ERROR_CODES, McpError } from "@earendil-works/pi-mcp";
 import type { Card, CardActionRequest, CardActionResult, CardElement, CardSelectOption } from "../../shared/cards.ts";
 import { t } from "../../shared/i18n.ts";
 
+export const URL_ELICITATION_REQUIRED_CODE = -32042;
+
 export type McpElicitationAction = "accept" | "decline" | "cancel";
 export type McpElicitationPrimitive = string | number | boolean | string[];
 export type McpElicitationContent = Record<string, McpElicitationPrimitive>;
@@ -26,6 +28,7 @@ export type ElicitationField =
     format?: "email" | "uri" | "date" | "date-time" | "password";
     minLength?: number;
     maxLength?: number;
+    pattern?: string;
     default?: string;
   }
   | {
@@ -60,6 +63,8 @@ export type ElicitationField =
     integer: boolean;
     min?: number;
     max?: number;
+    exclusiveMin?: number;
+    exclusiveMax?: number;
     default?: number;
   }
   | {
@@ -74,7 +79,7 @@ export type ElicitationField =
 
 export type ParsedMcpElicitation =
   | { mode: "form"; message: string; fields: ElicitationField[] }
-  | { mode: "url"; message: string; url: string; elicitationId?: string };
+  | { mode: "url"; message: string; url: string; host: string; elicitationId?: string };
 
 export type ElicitationActionOutcome =
   | { ok: true; mcpResult: McpElicitationResult; cardResult: CardActionResult }
@@ -127,6 +132,12 @@ function parseField(name: string, schema: Record<string, unknown>, required: boo
     let min = finiteNum(schema.minimum);
     let max = finiteNum(schema.maximum);
     if (min !== undefined && max !== undefined && min > max) { min = undefined; max = undefined; }
+    let exclusiveMin = finiteNum(schema.exclusiveMinimum);
+    let exclusiveMax = finiteNum(schema.exclusiveMaximum);
+    if (exclusiveMin !== undefined && exclusiveMax !== undefined && exclusiveMin >= exclusiveMax) {
+      exclusiveMin = undefined;
+      exclusiveMax = undefined;
+    }
     return {
       name,
       label,
@@ -137,6 +148,8 @@ function parseField(name: string, schema: Record<string, unknown>, required: boo
       integer: type === "integer",
       ...(min !== undefined ? { min } : {}),
       ...(max !== undefined ? { max } : {}),
+      ...(exclusiveMin !== undefined ? { exclusiveMin } : {}),
+      ...(exclusiveMax !== undefined ? { exclusiveMax } : {}),
       ...(finiteNum(schema.default) !== undefined ? { default: schema.default as number } : {}),
     };
   }
@@ -192,6 +205,14 @@ function parseField(name: string, schema: Record<string, unknown>, required: boo
   let minLength = nonNegInt(schema.minLength);
   let maxLength = nonNegInt(schema.maxLength);
   if (minLength !== undefined && maxLength !== undefined && minLength > maxLength) { minLength = undefined; maxLength = undefined; }
+  const rawPattern = typeof schema.pattern === "string" && schema.pattern.length > 0 && schema.pattern.length <= 256 ? schema.pattern : undefined;
+  let pattern: string | undefined;
+  if (rawPattern) {
+    try {
+      new RegExp(rawPattern, "u");
+      pattern = rawPattern;
+    } catch { /* ignore invalid regex from server schema */ }
+  }
   const format = schema.format === "email" || schema.format === "uri" || schema.format === "date" || schema.format === "date-time" || schema.format === "password"
     ? schema.format
     : undefined;
@@ -205,16 +226,18 @@ function parseField(name: string, schema: Record<string, unknown>, required: boo
     ...(format ? { format } : {}),
     ...(minLength !== undefined ? { minLength } : {}),
     ...(maxLength !== undefined ? { maxLength } : {}),
+    ...(pattern ? { pattern } : {}),
     ...(typeof schema.default === "string" ? { default: schema.default } : {}),
   };
 }
 
-/** 校验并解析标准 MCP `elicitation/create` 参数（支持 form 与 url 模式）。 */
+/** 校验并解析标准 MCP `elicitation/create` 参数（支持 form 与 url 模式；缺省 mode 且仅提供 url 时自动推断为 url）。 */
 export function parseElicitationRequest(params: unknown): ParsedMcpElicitation {
   if (!isObject(params)) throw new McpError(JSON_RPC_ERROR_CODES.invalidParams, "Invalid elicitation/create params");
   const message = typeof params.message === "string" ? params.message.trim() : "";
   if (!message) throw new McpError(JSON_RPC_ERROR_CODES.invalidParams, "elicitation/create requires a non-empty message");
-  const mode = params.mode === undefined ? "form" : params.mode;
+  const inferredUrl = params.mode === undefined && typeof params.url === "string" && params.url.trim() && params.requestedSchema === undefined;
+  const mode = params.mode === undefined ? (inferredUrl ? "url" : "form") : params.mode;
 
   if (mode === "url") {
     const rawUrl = typeof params.url === "string" ? params.url.trim() : "";
@@ -227,8 +250,11 @@ export function parseElicitationRequest(params: unknown): ParsedMcpElicitation {
     if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
       throw new McpError(JSON_RPC_ERROR_CODES.invalidParams, "elicitation/create url must use http or https");
     }
+    if (parsedUrl.username || parsedUrl.password) {
+      throw new McpError(JSON_RPC_ERROR_CODES.invalidParams, "elicitation/create url must not contain embedded credentials");
+    }
     const elicitationId = typeof params.elicitationId === "string" && params.elicitationId.trim() ? params.elicitationId.trim() : undefined;
-    return { mode: "url", message, url: parsedUrl.toString(), ...(elicitationId ? { elicitationId } : {}) };
+    return { mode: "url", message, url: parsedUrl.toString(), host: parsedUrl.host, ...(elicitationId ? { elicitationId } : {}) };
   }
 
   if (mode !== "form") {
@@ -360,18 +386,40 @@ function fieldToCardElement(field: ElicitationField, redact: (text: string) => s
   };
 }
 
+/** 从 MCP -32042 (URLElicitationRequiredError) 的 error.data 提取所有待完成的 URL Elicitation 请求。 */
+export function extractUrlElicitationsFromError(error: unknown): Extract<ParsedMcpElicitation, { mode: "url" }>[] {
+  if (!(error instanceof McpError) || error.code !== URL_ELICITATION_REQUIRED_CODE || !isObject(error.data)) return [];
+  const rawList = Array.isArray(error.data.elicitations)
+    ? error.data.elicitations
+    : typeof error.data.url === "string"
+      ? [error.data]
+      : [];
+  const result: Extract<ParsedMcpElicitation, { mode: "url" }>[] = [];
+  for (const item of rawList) {
+    if (!isObject(item)) continue;
+    const parsed = parseElicitationRequest({ ...item, mode: "url" });
+    if (parsed.mode === "url") result.push(parsed);
+  }
+  return result;
+}
+
 /** 把标准 MCP `elicitation/create` 翻译成 Hob 卡片 JSON 2.0。 */
 export function buildElicitationCard(parsed: ParsedMcpElicitation, pluginName: string, redact: (text: string) => string = (text) => text): Card {
   const safeMessage = redact(parsed.message);
   if (parsed.mode === "url") {
     return {
-      header: { title: t("{plugin} 请求外部确认", { plugin: pluginName }) },
+      header: {
+        title: t("{plugin} 请求外部确认", { plugin: pluginName }),
+        subtitle: t("目标网站：{host}", { host: parsed.host }),
+      },
       body: {
         elements: [
           { tag: "markdown", content: safeMessage },
           { tag: "div", text: parsed.url },
+          { tag: "div", text: t("点击「打开链接」将在浏览器新窗口中打开外部页面，请确认目标网站可信。") },
           { tag: "button", text: t("打开链接"), type: "primary_filled", behaviors: [{ type: "open_url", default_url: parsed.url }] },
           { tag: "button", text: t("已完成"), type: "default", behaviors: [{ type: "callback", value: { elicitation_action: "accept" } }] },
+          { tag: "button", text: t("拒绝"), type: "danger", behaviors: [{ type: "callback", value: { elicitation_action: "decline" } }] },
           { tag: "button", text: t("取消"), type: "default", behaviors: [{ type: "callback", value: { elicitation_action: "cancel" } }] },
         ],
       },
@@ -475,7 +523,7 @@ export function resolveElicitationAction(parsed: ParsedMcpElicitation, input: Ca
   const errors: Record<string, string> = {};
 
   for (const field of parsed.fields) {
-    const raw = rawValues[field.name];
+    const raw = rawValues[field.name] !== undefined ? rawValues[field.name] : field.default;
     if (field.kind === "boolean") {
       const value = typeof raw === "boolean" ? raw : field.default ?? false;
       content[field.name] = value;
@@ -504,6 +552,14 @@ export function resolveElicitationAction(parsed: ParsedMcpElicitation, input: Ca
       }
       if (field.max !== undefined && parsedNum > field.max) {
         errors[field.name] = t("不能大于 {value}", { value: field.max });
+        continue;
+      }
+      if (field.exclusiveMin !== undefined && parsedNum <= field.exclusiveMin) {
+        errors[field.name] = t("必须大于 {value}", { value: field.exclusiveMin });
+        continue;
+      }
+      if (field.exclusiveMax !== undefined && parsedNum >= field.exclusiveMax) {
+        errors[field.name] = t("必须小于 {value}", { value: field.exclusiveMax });
         continue;
       }
       content[field.name] = parsedNum;
@@ -572,6 +628,14 @@ export function resolveElicitationAction(parsed: ParsedMcpElicitation, input: Ca
     if (field.format === "date-time" && !isValidIsoDateTime(text.trim())) {
       errors[field.name] = t("请输入有效日期时间");
       continue;
+    }
+    if (field.pattern) {
+      try {
+        if (!new RegExp(field.pattern, "u").test(text)) {
+          errors[field.name] = t("格式不符合要求");
+          continue;
+        }
+      } catch { /* ignore invalid regex */ }
     }
     content[field.name] = text;
     displayFields[field.name] = field.sensitive ? "••••••" : text;

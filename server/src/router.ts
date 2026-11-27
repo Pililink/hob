@@ -1421,6 +1421,13 @@ export class RouterManager {
         if (!current || current.status !== "open") return;
         this.updateCard({ ...current, status: "done", feedback: { unavailable: reason }, updatedAt: new Date().toISOString() });
       },
+      complete: (result) => {
+        const current = this.store.card(id);
+        if (!current || current.status !== "open") return;
+        const next: CardRecord = { ...current, status: "done", result, updatedAt: new Date().toISOString() };
+        delete next.feedback;
+        this.updateCard(next);
+      },
     };
   }
 

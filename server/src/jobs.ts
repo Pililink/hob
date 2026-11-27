@@ -537,14 +537,30 @@ export class JobManager {
       if (worker) {
         worker.waitingElicitations = (worker.waitingElicitations ?? 0) + 1;
         if (worker.pausedAt === undefined) worker.pausedAt = Date.now();
+        const latest = this.store.job(job.id);
+        if (latest?.status === "running" && !worker.stopped) {
+          const waiting: Job = { ...latest, status: "waiting" };
+          this.store.saveJob(waiting);
+          worker.job = waiting;
+          this.bus.emit({ type: "job", job: waiting });
+        }
       }
       const releaseWait = () => {
         const current = this.workers.get(job.id);
         if (!current) return;
         current.waitingElicitations = Math.max(0, (current.waitingElicitations ?? 1) - 1);
-        if (!current.waitingElicitations && !current.ask && current.pausedAt !== undefined) {
-          current.pausedMs += Date.now() - current.pausedAt;
-          current.pausedAt = undefined;
+        if (!current.waitingElicitations && !current.ask) {
+          if (current.pausedAt !== undefined) {
+            current.pausedMs += Date.now() - current.pausedAt;
+            current.pausedAt = undefined;
+          }
+          const latest = this.store.job(job.id);
+          if (latest?.status === "waiting" && !current.stopped) {
+            const resumed: Job = { ...latest, status: "running" };
+            this.store.saveJob(resumed);
+            current.job = resumed;
+            this.bus.emit({ type: "job", job: resumed });
+          }
         }
         current.lastActivityAt = Date.now();
       };
@@ -1352,7 +1368,7 @@ export class JobManager {
   resolveAsk(approval: Approval, answer: string): void {
     const worker = approval.jobId ? this.workers.get(approval.jobId) : undefined;
     const job = approval.jobId ? this.store.job(approval.jobId) : undefined;
-    if (job && job.status === "waiting") {
+    if (job && job.status === "waiting" && !worker?.waitingElicitations) {
       const next: Job = { ...job, status: "running" };
       this.store.saveJob(next);
       this.bus.emit({ type: "job", job: next });

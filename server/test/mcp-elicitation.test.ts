@@ -50,12 +50,15 @@ describe("mcp elicitation parser and card builder", () => {
     expect(formCard.body.elements.filter((el) => el.tag === "button")).toHaveLength(2);
 
     const urlParsed = parseElicitationRequest({
-      mode: "url",
       message: "请完成 SSO 认证",
       url: "https://sso.example.com/login",
+      elicitationId: "sso-1",
     });
+    expect(urlParsed.mode).toBe("url");
     const urlCard = buildElicitationCard(urlParsed, "OpsKat");
     expect(validateCard(urlCard, { mode: "plugin" }).ok).toBe(true);
+    expect(urlCard.header?.subtitle).toBe("目标网站：sso.example.com");
+    expect(urlCard.body.elements.filter((el) => el.tag === "button")).toHaveLength(4);
 
     // 校验非法输入
     const invalid = resolveElicitationAction(formParsed, {
@@ -77,7 +80,7 @@ describe("mcp elicitation parser and card builder", () => {
     if (valid.ok) {
       expect(valid.mcpResult).toEqual({
         action: "accept",
-        content: { title: "重启服务", env: "prod", count: 3, confirm: true, tags: ["a"], token: "s3cr3t" },
+        content: { title: "重启服务", env: "prod", count: 3, confirm: true, day: "2026-11-27", tags: ["a"], token: "s3cr3t" },
       });
       expect(valid.cardResult.fields?.token).toBe("••••••");
       expect(valid.cardResult.fields?.env).toBe("生产");
@@ -88,6 +91,7 @@ describe("mcp elicitation parser and card builder", () => {
     expect(() => parseElicitationRequest(null)).toThrow(McpError);
     expect(() => parseElicitationRequest({ message: "   " })).toThrow(McpError);
     expect(() => parseElicitationRequest({ mode: "url", message: "open", url: "javascript:alert(1)" })).toThrow(McpError);
+    expect(() => parseElicitationRequest({ mode: "url", message: "phish", url: "https://github.com@evil.com/auth" })).toThrow(McpError);
     expect(() => parseElicitationRequest({ mode: "unknown", message: "hi" })).toThrow(McpError);
     expect(() => parseElicitationRequest({
       message: "bad schema",
@@ -125,6 +129,40 @@ describe("mcp elicitation parser and card builder", () => {
     if (!badDate.ok) {
       expect(badDate.errors.day).toContain("YYYY-MM-DD");
       expect(badDate.errors.at).toBe("请输入有效日期时间");
+    }
+
+    // pattern、exclusiveMinimum/Maximum 与 default 回退校验
+    const strictParsed = parseElicitationRequest({
+      message: "严格参数",
+      requestedSchema: {
+        type: "object",
+        properties: {
+          code: { type: "string", pattern: "^[A-Z]{3}-\\d{2}$" },
+          ratio: { type: "number", exclusiveMinimum: 0, exclusiveMaximum: 1 },
+          region: { type: "string", default: "cn-east" },
+        },
+        required: ["code", "ratio", "region"],
+      },
+    });
+    const strictBad = resolveElicitationAction(strictParsed, {
+      action: { tag: "button", elicitation_action: "accept" },
+      form_value: { code: "bad", ratio: 0 },
+    });
+    expect(strictBad.ok).toBe(false);
+    if (!strictBad.ok) {
+      expect(strictBad.errors.code).toBe("格式不符合要求");
+      expect(strictBad.errors.ratio).toBe("必须大于 0");
+    }
+    const strictGood = resolveElicitationAction(strictParsed, {
+      action: { tag: "button", elicitation_action: "accept" },
+      form_value: { code: "OPS-42", ratio: 0.5 },
+    });
+    expect(strictGood.ok).toBe(true);
+    if (strictGood.ok) {
+      expect(strictGood.mcpResult).toEqual({
+        action: "accept",
+        content: { code: "OPS-42", ratio: 0.5, region: "cn-east" },
+      });
     }
   });
 });
@@ -340,9 +378,10 @@ describe("mcp elicitation runtime flow", () => {
       await vi.waitFor(() => expect(hob.runtime.store.cards().some((c) => c.status === "open" && c.plugin?.elicitation)).toBe(true), { timeout: 5000 });
       const card = hob.runtime.store.cards().find((c) => c.status === "open" && c.plugin?.elicitation)!;
 
-      // 等待用户点卡期间即使时间过了很久，也不应被 checkStalls 判成卡死
+      // 等待用户点卡期间任务状态切换为 waiting，且即使时间过了很久也不应被 checkStalls 判成卡死
+      expect(hob.runtime.store.job(job.id)?.status).toBe("waiting");
       hob.runtime.jobs.checkStalls(Date.now() + 60 * 60_000);
-      expect(hob.runtime.store.job(job.id)?.status).toBe("running");
+      expect(hob.runtime.store.job(job.id)?.status).toBe("waiting");
 
       const answer = await answerCard(hob.runtime, card.id, {
         action: { tag: "button", elicitation_action: "accept" },
@@ -352,6 +391,71 @@ describe("mcp elicitation runtime flow", () => {
       await hob.runtime.jobs.waitIdle(30_000);
       expect(hob.runtime.store.job(job.id)?.status).toBe("done");
       expect(hob.runtime.store.job(job.id)?.summary).toContain("磁盘检查完成");
+    } finally {
+      await hob.runtime.plugins.close();
+      hob.close();
+    }
+  });
+
+  it("handles notifications/elicitation/complete and -32042 URLElicitationRequiredError retries and declines", async () => {
+    const hob = makeHob({}, { memory: "off" });
+    try {
+      const host = await setupElicitationPlugin(hob);
+
+      // 1. 服务端推送 notifications/elicitation/complete 自动完成卡片并放行工具
+      let notifyResult = "";
+      hob.faux.setResponses([
+        call("github_url_complete_notify", {}),
+        (context) => {
+          const last = context.messages.findLast((m) => m.role === "toolResult");
+          notifyResult = last && "content" in last ? (last.content as { text?: string }[]).map((b) => b.text ?? "").join("") : "";
+          return text("外链自动完成");
+        },
+      ]);
+      await hob.runtime.router.send("hob", { text: "测试外部完成通知" });
+      await hob.runtime.router.waitIdle("hob");
+      expect(JSON.parse(notifyResult)).toEqual({ notified: true, res: { action: "accept" } });
+      const notifiedCard = hob.runtime.store.cards().find((c) => c.plugin?.elicitation)!;
+      expect(notifiedCard).toMatchObject({ status: "done", result: { buttonText: "已完成" } });
+
+      // 2. -32042 URLElicitationRequiredError -> 用户确认后自动重试原 tools/call 并成功
+      let retryResult = "";
+      hob.faux.setResponses([
+        call("github_url_error_retry", { key: "accept-case" }),
+        (context) => {
+          const last = context.messages.findLast((m) => m.role === "toolResult");
+          retryResult = last && "content" in last ? (last.content as { text?: string }[]).map((b) => b.text ?? "").join("") : "";
+          return text("授权重试成功");
+        },
+      ]);
+      const retryTurn = hob.runtime.router.send("hob", { text: "触发 -32042 重试" });
+      await vi.waitFor(() => expect(hob.runtime.store.cards().some((c) => c.status === "open" && c.plugin?.elicitation)).toBe(true), { timeout: 5000 });
+      const retryCard = hob.runtime.store.cards().find((c) => c.status === "open" && c.plugin?.elicitation)!;
+      expect(retryCard.card.header?.subtitle).toBe("目标网站：oauth.example.com");
+      await answerCard(hob.runtime, retryCard.id, { action: { tag: "button", elicitation_action: "accept" }, button_text: "已完成" });
+      await retryTurn;
+      await hob.runtime.router.waitIdle("hob");
+      expect(retryResult).toBe("oauth retry succeeded: accept-case");
+
+      // 3. -32042 URLElicitationRequiredError -> 用户拒绝后优雅返回错误且不污染插件连接状态
+      let declineResult = "";
+      hob.faux.setResponses([
+        call("github_url_error_retry", { key: "decline-case" }),
+        (context) => {
+          const last = context.messages.findLast((m) => m.role === "toolResult");
+          declineResult = last && "content" in last ? (last.content as { text?: string }[]).map((b) => b.text ?? "").join("") : "";
+          return text("用户拒绝了授权");
+        },
+      ]);
+      const declineTurn = hob.runtime.router.send("hob", { text: "触发 -32042 拒绝" });
+      await vi.waitFor(() => expect(hob.runtime.store.cards().some((c) => c.status === "open" && c.plugin?.elicitation)).toBe(true), { timeout: 5000 });
+      const declineCard = hob.runtime.store.cards().find((c) => c.status === "open" && c.plugin?.elicitation)!;
+      await answerCard(hob.runtime, declineCard.id, { action: { tag: "button", elicitation_action: "decline" }, button_text: "拒绝" });
+      await declineTurn;
+      await hob.runtime.router.waitIdle("hob");
+      expect(declineResult).toContain("拒绝");
+      expect(host.states("github")[0]).toMatchObject({ status: "connected" });
+      expect(host.states("github")[0]?.error).toBeUndefined();
     } finally {
       await hob.runtime.plugins.close();
       hob.close();

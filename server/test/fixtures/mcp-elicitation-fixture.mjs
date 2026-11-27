@@ -51,7 +51,19 @@ const TOOLS = [
     description: "发出 elicitation 后由服务端主动取消",
     inputSchema: { type: "object", properties: {} },
   },
+  {
+    name: "url_complete_notify",
+    description: "URL 确认后由服务端推送 notifications/elicitation/complete 自动完成",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "url_error_retry",
+    description: "首次返回 -32042 URLElicitationRequiredError，重试后成功",
+    inputSchema: { type: "object", properties: { key: { type: "string" } } },
+  },
 ];
+
+const retriedKeys = new Set();
 
 let buffer = "";
 process.stdin.setEncoding("utf8");
@@ -186,6 +198,47 @@ async function handle(message) {
         }, 50);
         const res = await promise;
         write({ jsonrpc: "2.0", id: message.id, result: { content: [{ type: "text", text: JSON.stringify({ cancelled: true, res }) }] } });
+        return;
+      }
+      if (name === "url_complete_notify") {
+        const { promise } = sendElicitation({
+          mode: "url",
+          message: "请前往外部页面完成授权（服务端完成后会自动通知）",
+          url: "https://oauth.example.com/callback?id=notify-1",
+          elicitationId: "notify-1",
+        });
+        setTimeout(() => {
+          write({ jsonrpc: "2.0", method: "notifications/elicitation/complete", params: { elicitationId: "notify-1" } });
+        }, 60);
+        const res = await promise;
+        write({ jsonrpc: "2.0", id: message.id, result: { content: [{ type: "text", text: JSON.stringify({ notified: true, res }) }] } });
+        return;
+      }
+      if (name === "url_error_retry") {
+        const key = String(args.key ?? "default");
+        if (!retriedKeys.has(key)) {
+          retriedKeys.add(key);
+          write({
+            jsonrpc: "2.0",
+            id: message.id,
+            error: {
+              code: -32042,
+              message: "URL elicitation required",
+              data: {
+                elicitations: [
+                  {
+                    mode: "url",
+                    elicitationId: `err-${key}`,
+                    url: `https://oauth.example.com/authorize?key=${encodeURIComponent(key)}`,
+                    message: "请先在浏览器完成 OAuth 授权",
+                  },
+                ],
+              },
+            },
+          });
+          return;
+        }
+        write({ jsonrpc: "2.0", id: message.id, result: { content: [{ type: "text", text: `oauth retry succeeded: ${key}` }] } });
         return;
       }
       write({ jsonrpc: "2.0", id: message.id, error: { code: -32602, message: `unknown tool ${name}` } });
