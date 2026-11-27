@@ -1,4 +1,4 @@
-import { pluginCommandToolsForAssistant, pluginToolsForAssistant } from "./plugin-host.ts";
+import { pluginCommandToolsForAssistant, pluginToolsForAssistant, type PluginElicitationCardHandle } from "./plugin-host.ts";
 import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
 import { parseStreamingJson } from "@earendil-works/pi-ai/utils/json-parse";
 import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
@@ -655,6 +655,7 @@ export class RouterManager {
     const pluginTools = pluginToolsForAssistant(this.runtime.plugins, assistant.id, existingNames, {
       onCard: (payload) => this.addPluginCard(assistant.id, place, payload),
       onCardError: (pluginId, message) => this.addPluginCardError(assistant.id, place, message),
+      onElicitation: (payload) => this.addPluginElicitationCard(assistant.id, place, payload),
     });
     const availableToolNames = [...new Set([...directToolNames, ...customTools.map((tool) => tool.name)])];
     const allowedTools = place.groupId ? availableToolNames.filter((name) => groupTool(name, assistant.primary)) : availableToolNames;
@@ -717,7 +718,9 @@ export class RouterManager {
         const credential = this.runtime.scriptTools.issue({
           tools: async () => {
             const reserved = new Set(existingNames);
-            const livePlugins = pluginToolsForAssistant(this.runtime.plugins, assistant.id, reserved);
+            const livePlugins = pluginToolsForAssistant(this.runtime.plugins, assistant.id, reserved, {
+              onElicitation: (payload) => this.addPluginElicitationCard(assistant.id, place, payload),
+            });
             for (const tool of livePlugins) reserved.add(tool.name);
             const commandTools = pluginCommandToolsForAssistant(this.runtime.plugins, assistant.id, reserved);
             return scriptToolList(tools, !!(await boundKnowledge(this.runtime, assistant.id)).length, livePlugins, commandTools);
@@ -1393,6 +1396,32 @@ export class RouterManager {
   updateCard(record: CardRecord): void {
     this.store.saveCard(record);
     this.bus.emit({ type: "card", card: record });
+  }
+
+  async addPluginElicitationCard(
+    assistantId: string,
+    place: Place | undefined,
+    payload: { pluginId: string; pluginName: string; service: string; card: CardRecord["card"] },
+  ): Promise<PluginElicitationCardHandle> {
+    const id = newId("c-");
+    const record: CardRecord = {
+      id,
+      owner: { type: "plugin", pluginId: payload.pluginId, assistantId },
+      plugin: { service: payload.service, pluginName: payload.pluginName, elicitation: true },
+      ...placeFields(place),
+      card: payload.card,
+      status: "open",
+      createdAt: new Date().toISOString(),
+    };
+    await this.addCard(assistantId, record, place);
+    return {
+      cardId: id,
+      expire: (reason) => {
+        const current = this.store.card(id);
+        if (!current || current.status !== "open") return;
+        this.updateCard({ ...current, status: "done", feedback: { unavailable: reason }, updatedAt: new Date().toISOString() });
+      },
+    };
   }
 
   private async addPluginCard(assistantId: string, place: Place | undefined, payload: { pluginId: string; pluginName: string; service: string; callbackTool?: string; card: CardRecord["card"] }): Promise<void> {

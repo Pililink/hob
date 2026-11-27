@@ -5,12 +5,14 @@ import { fileURLToPath } from "node:url";
 import { readSecrets } from "./secrets.ts";
 import { pluginOAuthLoggedIn, pluginOAuthNeedsRelogin, pluginOAuthProvider, type PluginOAuthConfig } from "./plugin-oauth.ts";
 import { McpOAuthAuthorizationRequiredError } from "@earendil-works/pi-mcp/oauth";
-import { McpAuthRequiredError, McpClient, McpHttpError, StdioTransport, StreamableHttpTransport, limitMcpContent, normalizeMcpInputSchema, toLlmContent, validateMcpServerConfig, type Tool } from "@earendil-works/pi-mcp";
-import type { Card } from "../../shared/cards.ts";
+import { JSON_RPC_ERROR_CODES, McpAuthRequiredError, McpClient, McpError, McpHttpError, StdioTransport, StreamableHttpTransport, limitMcpContent, normalizeMcpInputSchema, toLlmContent, validateMcpServerConfig, type Tool } from "@earendil-works/pi-mcp";
+import type { Card, CardActionRequest, CardActionResult } from "../../shared/cards.ts";
 import type { PluginCredentialRole, PluginLoginRole, PluginToolLoginPollResult, PluginToolLoginStartResult, PluginToolLoginStatus, PluginToolLoginView } from "../../shared/types.ts";
 import { t } from "../../shared/i18n.ts";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { cardTitle, validateCard } from "./cards.ts";
+import { buildElicitationCard, parseElicitationRequest, resolveElicitationAction, type McpElicitationResult, type ParsedMcpElicitation } from "./mcp-elicitation.ts";
+import { pauseToolTimeoutForUser } from "./tool-timeout.ts";
 import type { TSchema } from "typebox";
 import { resolvePluginMcp, validatePluginValues } from "./plugin-config.ts";
 import { PluginStore } from "./plugin-store.ts";
@@ -20,12 +22,24 @@ export type PluginConnectionStatus = "pending_config" | "connecting" | "idle" | 
 export interface PluginServiceState { pluginId: string; name: string; status: PluginConnectionStatus; missing?: string[]; error?: string; tools: Tool[]; toolErrors?: { name: string; reason: string }[]; oauth?: { declared: boolean; loggedIn: boolean }; login?: { roles: PluginLoginRole[]; status?: PluginToolLoginStatus } }
 export interface CredentialProvider { pluginId: string; providerName: string; service: string; tool: string; role: PluginCredentialRole }
 export interface LoginToolProvider { pluginId: string; service: string; tool: string; role: PluginLoginRole }
+type ActiveCallContext = {
+  onElicitation: PluginElicitationHandler;
+  signal?: AbortSignal;
+};
+type PendingElicitation = {
+  pluginId: string;
+  service: string;
+  parsed: ParsedMcpElicitation;
+  resolve: (result: McpElicitationResult) => void;
+  expire: (reason: string) => void;
+};
 type Connection = {
   state: PluginServiceState;
   client?: McpClient;
   retry?: NodeJS.Timeout;
   retryCount?: number;
   activeCalls?: number;
+  callContexts?: ActiveCallContext[];
   onIdle?: Set<() => void>;
   idle?: NodeJS.Timeout;
   connecting?: Promise<void>;
@@ -143,6 +157,7 @@ export class PluginHost {
   private connections = new Map<string, Connection>();
   private reloads = new Map<string, Promise<void>>();
   private redactionValues = new Map<string, string[]>();
+  private pendingElicitations = new Map<string, PendingElicitation>();
   private closed = false;
   migrationErrors: string[] = [];
   onToolsChanged?: () => void;
@@ -437,13 +452,20 @@ export class PluginHost {
     const parsed = validateMcpServerConfig(state.name, raw);
     if (parsed.kind === "invalid") { state.status = "error"; state.error = this.redact(state.pluginId, parsed.error); this.scheduleRetry(connection, raw); return; }
     connection.kind = parsed.kind;
-    const client = new McpClient({ name: "Hob", version: "1.0", requestTimeoutMs: (parsed.config.timeout ?? 15) * 1000 });
+    const client = new McpClient({
+      name: "Hob",
+      version: "1.0",
+      capabilities: { elicitation: { form: {}, url: {} } },
+      requestTimeoutMs: (parsed.config.timeout ?? 15) * 1000,
+    });
     connection.client = client;
+    client.setRequestHandler("elicitation/create", (params, { signal }) => this.handleElicitation(connection, params, signal));
     client.onClose(() => {
       if (connection.stopped || this.closed || connection.client !== client) return;
       connection.client = undefined;
       if (connection.idle) clearTimeout(connection.idle);
       connection.idle = undefined;
+      this.cancelElicitationsForService(state.pluginId, state.name, t("这项确认已失效，请让助手重新发起。"));
       state.status = "error"; state.error = "MCP 连接已断开"; state.tools = []; delete state.login;
       this.onToolsChanged?.();
       this.scheduleRetry(connection, raw);
@@ -521,7 +543,88 @@ export class PluginHost {
     if (connection.state.status === "idle" || connection.state.status === "connecting") await this.connect(connection, connection.raw);
     if (connection.state.status !== "connected" || !connection.client) throw new Error(connection.state.error ?? `插件服务 ${connection.state.pluginId}/${connection.state.name} 未连接`);
   }
-  async call(id: string, service: string, tool: string, args: Record<string, unknown>, signal?: AbortSignal) {
+  private async handleElicitation(connection: Connection, params: unknown, requestSignal: AbortSignal): Promise<McpElicitationResult> {
+    const parsed = parseElicitationRequest(params);
+    // MCP 2025-11-25 的 elicitation/create 载荷不含父 tools/call 的 requestId；共享连接上归属到最近一个未中止的活跃调用上下文。
+    const contexts = connection.callContexts ?? [];
+    const active = [...contexts].reverse().find((ctx) => !ctx.signal?.aborted);
+    if (!active) return { action: "decline" };
+    if (requestSignal.aborted) return { action: "cancel" };
+    const pluginId = connection.state.pluginId;
+    const service = connection.state.name;
+    const pluginName = this.displayName(pluginId);
+    const card = buildElicitationCard(parsed, pluginName, (text) => this.redact(pluginId, text));
+    const validation = validateCard(card, { mode: "plugin" });
+    if (!validation.ok) {
+      throw new McpError(JSON_RPC_ERROR_CODES.invalidParams, `Elicitation card invalid: ${validation.error.error}`);
+    }
+    const resumeTimeout = pauseToolTimeoutForUser(active.signal);
+    let handle: PluginElicitationCardHandle | undefined;
+    try {
+      handle = await active.onElicitation({ pluginId, pluginName, service, card: validation.value.card });
+      if (requestSignal.aborted || active.signal?.aborted) {
+        handle.expire(requestSignal.aborted ? t("这项确认已取消") : t("这次操作已取消"));
+        return { action: "cancel" };
+      }
+      return await new Promise<McpElicitationResult>((resolve) => {
+        let settled = false;
+        const finish = (result: McpElicitationResult) => {
+          if (settled) return;
+          settled = true;
+          requestSignal.removeEventListener("abort", onRequestAbort);
+          active.signal?.removeEventListener("abort", onCallAbort);
+          this.pendingElicitations.delete(handle!.cardId);
+          resolve(result);
+        };
+        const onRequestAbort = () => {
+          handle!.expire(t("这项确认已取消"));
+          finish({ action: "cancel" });
+        };
+        const onCallAbort = () => {
+          handle!.expire(t("这次操作已取消"));
+          finish({ action: "cancel" });
+        };
+        this.pendingElicitations.set(handle!.cardId, {
+          pluginId,
+          service,
+          parsed,
+          resolve: finish,
+          expire: handle!.expire,
+        });
+        requestSignal.addEventListener("abort", onRequestAbort, { once: true });
+        active.signal?.addEventListener("abort", onCallAbort, { once: true });
+      });
+    } finally {
+      handle?.onDone?.();
+      resumeTimeout();
+    }
+  }
+  answerElicitation(cardId: string, input: CardActionRequest): { found: false } | { found: true; ok: false; errors: Record<string, string> } | { found: true; ok: true; cardResult: CardActionResult } {
+    const pending = this.pendingElicitations.get(cardId);
+    if (!pending) return { found: false };
+    const outcome = resolveElicitationAction(pending.parsed, input);
+    if (!outcome.ok) return { found: true, ok: false, errors: outcome.errors };
+    this.pendingElicitations.delete(cardId);
+    pending.resolve(outcome.mcpResult);
+    return { found: true, ok: true, cardResult: outcome.cardResult };
+  }
+  private cancelElicitationsForService(pluginId: string, service: string, reason: string): void {
+    for (const [cardId, entry] of [...this.pendingElicitations]) {
+      if (entry.pluginId !== pluginId || entry.service !== service) continue;
+      this.pendingElicitations.delete(cardId);
+      entry.expire(reason);
+      entry.resolve({ action: "cancel" });
+    }
+  }
+  cancelElicitationsForPlugin(pluginId: string, reason: string): void {
+    for (const [cardId, entry] of [...this.pendingElicitations]) {
+      if (entry.pluginId !== pluginId) continue;
+      this.pendingElicitations.delete(cardId);
+      entry.expire(reason);
+      entry.resolve({ action: "cancel" });
+    }
+  }
+  async call(id: string, service: string, tool: string, args: Record<string, unknown>, signal?: AbortSignal, options?: { onElicitation?: PluginElicitationHandler }) {
     const connection = this.connections.get(this.key(id, service));
     if (!connection) throw new Error(`插件服务 ${id}/${service} 未连接`);
     await this.ensureConnected(connection);
@@ -529,9 +632,12 @@ export class PluginHost {
     if (!client) throw new Error(connection.state.error ?? `插件服务 ${id}/${service} 未连接`);
     const hadCredentials = connection.hadCredentials === true;
     connection.activeCalls = (connection.activeCalls ?? 0) + 1;
+    const callContext = options?.onElicitation ? { onElicitation: options.onElicitation, signal } : undefined;
+    if (callContext) (connection.callContexts ??= []).push(callContext);
     if (connection.idle) clearTimeout(connection.idle);
     connection.idle = undefined;
-    try { return await client.callTool(tool, args, signal ? { signal, timeoutMs: 0 } : {}); }
+    const callOptions = signal || options?.onElicitation ? { ...(signal ? { signal } : {}), timeoutMs: 0 } : {};
+    try { return await client.callTool(tool, args, callOptions); }
     catch (error) {
       const authError = error instanceof McpOAuthAuthorizationRequiredError || (error instanceof McpHttpError && (error.status === 401 || error.status === 403));
       if (authError) connection.state.status = hadCredentials ? "needs_relogin" : "needs_login";
@@ -544,6 +650,10 @@ export class PluginHost {
       if (connection.state.status !== "connected") this.onToolsChanged?.();
       throw new Error(message, { cause: error });
     } finally {
+      if (callContext && connection.callContexts) {
+        const index = connection.callContexts.indexOf(callContext);
+        if (index >= 0) connection.callContexts.splice(index, 1);
+      }
       connection.activeCalls!--;
       if (!connection.activeCalls) {
         for (const resolve of connection.onIdle ?? []) resolve();
@@ -553,6 +663,7 @@ export class PluginHost {
     }
   }
   async stopPlugin(id: string): Promise<void> {
+    this.cancelElicitationsForPlugin(id, t("这项确认已失效，请让助手重新发起。"));
     const closing: Promise<void>[] = [];
     for (const [key, connection] of this.connections) {
       if (connection.state.pluginId !== id) continue;
@@ -607,9 +718,16 @@ export function pluginToolDisplayNames(host: PluginHost): Record<string, string>
 
 export type PluginCardHandler = (card: { pluginId: string; pluginName: string; service: string; callbackTool?: string; card: Card }) => void | Promise<void>;
 export type PluginCardErrorHandler = (pluginId: string, message: string) => void | Promise<void>;
+export interface PluginElicitationCardHandle {
+  cardId: string;
+  expire: (reason: string) => void;
+  onDone?: () => void;
+}
+export type PluginElicitationHandler = (payload: { pluginId: string; pluginName: string; service: string; card: Card }) => Promise<PluginElicitationCardHandle>;
 export interface PluginToolOptions {
   onCard?: PluginCardHandler;
   onCardError?: PluginCardErrorHandler;
+  onElicitation?: PluginElicitationHandler;
 }
 
 export type PluginAgentTool = Omit<ToolDefinition<any, any>, "execute"> & {
@@ -653,7 +771,7 @@ export function pluginToolsForAssistant(host: PluginHost, assistantId: string, r
           annotations: tool.annotations,
           execute: async (_callId, args, signal) => {
             if (!isObject(args)) throw new Error("插件工具参数必须是对象");
-            const response = await host.call(plugin.id, state.name, tool.name, args, signal);
+            const response = await host.call(plugin.id, state.name, tool.name, args, signal, options.onElicitation ? { onElicitation: options.onElicitation } : undefined);
             if (response.isError) response.content = response.content.map(block => block.type === "text" ? { ...block, text: host.redact(plugin.id, block.text) } : block);
             const limited = await limitMcpContent(toLlmContent(response));
             const content = [...limited.content];

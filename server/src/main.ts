@@ -14,7 +14,7 @@ import { ensurePlaywrightCli } from "./playwright-cli.ts";
 import { readLegacyModels } from "./settings.ts";
 import { releaseIdleTodosAtStartup } from "./todos.ts";
 import { seedBuiltinVault, seedDefaultPlugins } from "./dev-team.ts";
-import { retirePluginCards } from "./actions.ts";
+import { recoverElicitationCards, retirePluginCards } from "./actions.ts";
 
 export interface StartOptions {
   home?: string;
@@ -74,6 +74,7 @@ export async function startHob(options: StartOptions = {}): Promise<HobServer> {
   syncGeneralIndex(generalSkillsDir(home));
   runtime.jobs.recover();
   runtime.delegations.recover();
+  recoverElicitationCards(runtime);
   runtime.groups.recoverHandovers();
   // 重启后没有在跑的一轮，任务按中断、转交按中断处理过了：手上没活的待办这时候收起
   releaseIdleTodosAtStartup(runtime);

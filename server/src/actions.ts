@@ -231,11 +231,47 @@ export function retirePluginCards(runtime: HobRuntime, pluginId: string): void {
   }
 }
 
+/** 进程重启后，磁盘里遗留的未处理 MCP Elicitation 卡片已无对应的挂起请求，启动时直接标作废。 */
+export function recoverElicitationCards(runtime: HobRuntime): void {
+  const unavailable = t("服务已重启，这项确认已失效，请让助手重新发起。");
+  const now = new Date().toISOString();
+  for (const card of runtime.store.cards()) {
+    if (card.status !== "open" || card.owner.type !== "plugin" || !card.plugin?.elicitation) continue;
+    const next: CardRecord = { ...card, status: "done", feedback: { unavailable }, updatedAt: now };
+    runtime.store.saveCard(next);
+    runtime.bus.emit({ type: "card", card: next });
+  }
+}
+
 const pluginCardCalls = new WeakMap<HobRuntime, Set<string>>();
+
+async function answerElicitationCard(runtime: HobRuntime, record: CardRecord, input: CardActionRequest): Promise<ActionResult> {
+  const outcome = runtime.plugins.answerElicitation(record.id, input);
+  if (!outcome.found) {
+    const unavailable = t("这项确认已失效，请让助手重新发起。");
+    const next: CardRecord = { ...record, status: "done", feedback: { unavailable }, updatedAt: new Date().toISOString() };
+    runtime.store.saveCard(next);
+    runtime.bus.emit({ type: "card", card: next });
+    return { status: 409, body: { error: unavailable, card: next } };
+  }
+  if (!outcome.ok) {
+    const next: CardRecord = { ...record, feedback: { errors: outcome.errors }, updatedAt: new Date().toISOString() };
+    runtime.store.saveCard(next);
+    runtime.bus.emit({ type: "card", card: next });
+    return { status: 200, body: { card: next } };
+  }
+  const next: CardRecord = { ...record, status: "done", result: outcome.cardResult, updatedAt: new Date().toISOString() };
+  delete next.feedback;
+  runtime.store.saveCard(next);
+  runtime.bus.emit({ type: "card", card: next });
+  return { status: 200, body: { card: next } };
+}
 
 async function answerPluginCard(runtime: HobRuntime, record: CardRecord, input: CardActionRequest): Promise<ActionResult> {
   const plugin = record.plugin;
-  if (!plugin || record.owner.type !== "plugin" || !plugin.callbackTool) return { status: 400, body: { error: "插件卡片没有可用的回调工具" } };
+  if (!plugin || record.owner.type !== "plugin") return { status: 400, body: { error: "插件卡片没有可用的回调工具" } };
+  if (plugin.elicitation) return answerElicitationCard(runtime, record, input);
+  if (!plugin.callbackTool) return { status: 400, body: { error: "插件卡片没有可用的回调工具" } };
   const pluginId = record.owner.type === "plugin" ? record.owner.pluginId : "";
   const installed = runtime.plugins.store.list().find((item) => item.id === pluginId);
   const service = runtime.plugins.states(pluginId).find((item) => item.name === plugin.service);

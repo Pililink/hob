@@ -60,7 +60,15 @@ export class ScriptToolCredentials {
             try { args = validateToolArguments(tool as never, { type: "toolCall", id: "script", name: input.name, arguments: (tool.prepareArguments ? tool.prepareArguments(input.args ?? {}) : input.args ?? {}) as never }); }
             catch (error) { return send(400, { error: error instanceof Error ? error.message : String(error) }); }
             context.onCall?.(tool);
-            const result = await tool.execute(randomUUID(), args, undefined, undefined, undefined as never);
+            const controller = new AbortController();
+            const onClose = () => { if (!response.writableEnded) controller.abort(); };
+            response.once("close", onClose);
+            let result;
+            try {
+              result = await tool.execute(randomUUID(), args, controller.signal, undefined, undefined as never);
+            } finally {
+              response.off("close", onClose);
+            }
             const text = result.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
             if (result.isError) return send(400, { error: text });
             return send(200, { value: result.structuredContent ?? text });

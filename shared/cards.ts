@@ -256,7 +256,7 @@ export interface CardRecord {
   id: string;
   owner: CardOwner;
   /** 插件卡的回调目标，只在服务端使用，不展示给模型。 */
-  plugin?: { service: string; callbackTool?: string; pluginName: string };
+  plugin?: { service: string; callbackTool?: string; pluginName: string; elicitation?: true };
   groupId?: string;
   topicId?: string;
   card: Card;

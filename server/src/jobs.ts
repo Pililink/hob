@@ -27,7 +27,7 @@ import { resolveMovedPath } from "./layout.ts";
 import { availableDesktopTools, browserShellEnv, type DesktopToolSession } from "./desktop-tools.ts";
 import { imageConfigured } from "./image.ts";
 import { boundKnowledge, findKnowledgeTool, searchKnowledgeTool } from "./knowledge-tools.ts";
-import { pluginCommandToolsForAssistant, pluginToolDisplayNames, pluginToolsForAssistant } from "./plugin-host.ts";
+import { pluginCommandToolsForAssistant, pluginToolDisplayNames, pluginToolsForAssistant, type PluginElicitationHandler } from "./plugin-host.ts";
 import { engineDir } from "./config.ts";
 import { jobModel, assistantForPlace } from "./models.ts";
 import { duration, jobProcessLines, reviewedSkillsText } from "./job-view.ts";
@@ -141,6 +141,8 @@ interface WorkerState {
   nextReminder: number;
   finishTimer?: NodeJS.Timeout;
   ask?: (label: string) => void;
+  /** 正在等待用户操作 MCP Elicitation 卡片的数量 */
+  waitingElicitations?: number;
   /** 用户叫停了：收尾期间这个 worker 的 report/追问都不再算数 */
   stopped?: boolean;
   /** 正在跑的工具步骤，按 toolCallId 存：输出更新、跑完都按同一个步骤 id 替换 */
@@ -530,7 +532,37 @@ export class JobManager {
     // 定时跑的就是 Worker：主助手的任务要看得到各助这段时间的动静才能写早报
     if (assistant?.primary) customTools.push(overviewTool(this.runtime));
     const existingNames = new Set([...workerTools(abilities), ...customTools.map(tool => tool.name), "tool_search"]);
-    const pluginTools = pluginToolsForAssistant(this.runtime.plugins, job.assistantId, existingNames);
+    const onElicitation: PluginElicitationHandler = async (payload) => {
+      const worker = this.workers.get(job.id);
+      if (worker) {
+        worker.waitingElicitations = (worker.waitingElicitations ?? 0) + 1;
+        if (worker.pausedAt === undefined) worker.pausedAt = Date.now();
+      }
+      const releaseWait = () => {
+        const current = this.workers.get(job.id);
+        if (!current) return;
+        current.waitingElicitations = Math.max(0, (current.waitingElicitations ?? 1) - 1);
+        if (!current.waitingElicitations && !current.ask && current.pausedAt !== undefined) {
+          current.pausedMs += Date.now() - current.pausedAt;
+          current.pausedAt = undefined;
+        }
+        current.lastActivityAt = Date.now();
+      };
+      try {
+        const handle = await this.runtime.router.addPluginElicitationCard(job.assistantId, placeOf(job), payload);
+        return {
+          ...handle,
+          onDone: () => {
+            handle.onDone?.();
+            releaseWait();
+          },
+        };
+      } catch (error) {
+        releaseWait();
+        throw error;
+      }
+    };
+    const pluginTools = pluginToolsForAssistant(this.runtime.plugins, job.assistantId, existingNames, { onElicitation });
     customTools.push(...pluginTools);
     const toolSearch = pluginTools.some(tool => tool.exposure === "deferred");
     const group = job.groupId ? this.store.group(job.groupId) : undefined;
@@ -576,7 +608,7 @@ export class JobManager {
         const credential = this.runtime.scriptTools.issue({
           tools: async () => {
             const reserved = new Set(existingNames);
-            const livePlugins = pluginToolsForAssistant(this.runtime.plugins, job.assistantId, reserved);
+            const livePlugins = pluginToolsForAssistant(this.runtime.plugins, job.assistantId, reserved, { onElicitation });
             for (const tool of livePlugins) reserved.add(tool.name);
             const commandTools = pluginCommandToolsForAssistant(this.runtime.plugins, job.assistantId, reserved);
             return scriptToolList(customTools, !!(await boundKnowledge(this.runtime, job.assistantId)).length, livePlugins, commandTools);
@@ -1381,8 +1413,8 @@ export class JobManager {
           }
         }
       }
-      // 在等用户答提问不算没响应：等多久都是用户的事
-      if (!worker.ask && !worker.session?.isStreaming && now - worker.lastActivityAt > idleMs) {
+      // 在等用户答提问或确认卡片不算没响应：等多久都是用户的事
+      if (!worker.ask && !worker.waitingElicitations && !worker.session?.isStreaming && now - worker.lastActivityAt > idleMs) {
         void this.finish(jobId, "stuck", undefined, `${Math.round(idleMs / 60_000)} 分钟无响应`);
       }
     }
